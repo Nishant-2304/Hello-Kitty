@@ -1,72 +1,82 @@
-import os.path
+"""Gmail drafts: per-user OAuth, using access tokens stored in the DB.
+
+The flow: when the user signs in via Google, GIS hands us an
+access_token. We store it in the users table along with its
+expiry. /run reads the token and uses it to call gmail.drafts().create().
+
+If the token is expired (rare — only if the user re-runs /run >1hr
+after their last sign-in), we don't refresh it. The user re-signs
+in. The access token is short-lived for security, but in practice
+our /run completes in seconds, well within the 1-hour window.
+"""
+from __future__ import annotations
+
 import base64
-
+from datetime import datetime, timezone
 from email.mime.text import MIMEText
-from google.auth.transport.requests import Request
-from google.oauth2.credentials import Credentials
-from google_auth_oauthlib.flow import InstalledAppFlow
-from googleapiclient.discovery import build
+from typing import Any
 
-SCOPES = [
-    "https://www.googleapis.com/auth/gmail.compose"
-]
+import httpx
+
+# Each user gets their own Gmail client, scoped to gmail.compose.
+SCOPES = ["https://www.googleapis.com/auth/gmail.compose"]
 
 
-def get_gmail_service():
+def _is_expired(user: dict[str, Any]) -> bool:
+    """True if the stored access token has passed its expiry."""
+    exp = user.get("access_expires_at", "")
+    if not exp:
+        return False  # unknown — assume not expired
+    try:
+        return datetime.fromisoformat(exp) <= datetime.now(timezone.utc)
+    except (ValueError, TypeError):
+        return False
 
-    creds = None
 
-    if os.path.exists("token.json"):
-        creds = Credentials.from_authorized_user_file(
-            "token.json",
-            SCOPES
+async def create_draft(
+    user: dict[str, Any],
+    *,
+    to: str,
+    subject: str,
+    body: str,
+    client_id: str,
+    client_secret: str,
+) -> dict[str, Any]:
+    """Create a Gmail draft in the user's account.
+
+    In dev mode (no client_id/client_secret), returns a fake response.
+    Production uses the stored access token directly.
+    """
+    if not client_id or not client_secret:
+        # Dev mode: don't actually call Gmail.
+        return {
+            "id": f"dev-draft-{hash((to, subject)) & 0xFFFF:04x}",
+            "to": to,
+            "subject": subject,
+            "body_preview": body[:60],
+        }
+
+    if _is_expired(user):
+        raise RuntimeError(
+            "Gmail access token expired. Please sign in again to refresh it."
         )
 
-    if not creds or not creds.valid:
-
-        if creds and creds.expired and creds.refresh_token:
-            creds.refresh(Request())
-
-        else:
-            flow = InstalledAppFlow.from_client_secrets_file(
-                "src/credentials.json",
-                SCOPES
-            )
-
-            creds = flow.run_local_server(port=0)
-
-        with open("token.json", "w") as token:
-            token.write(creds.to_json())
-
-    return build(
-        "gmail",
-        "v1",
-        credentials=creds
-    )
-
-
-
-
-def create_draft(to, subject, body):
-
-    service = get_gmail_service()
+    access_token = user["access_token"]
 
     message = MIMEText(body)
-
     message["to"] = to
     message["subject"] = subject
+    raw = base64.urlsafe_b64encode(message.as_bytes()).decode()
 
-    raw_message = base64.urlsafe_b64encode(
-        message.as_bytes()
-    ).decode()
-
-    draft = {
-        "message": {
-            "raw": raw_message
-        }
-    }
-
-    return service.users().drafts().create(
-        userId="me",
-        body=draft
-    ).execute()
+    async with httpx.AsyncClient(timeout=15) as client:
+        r = await client.post(
+            "https://gmail.googleapis.com/gmail/v1/users/me/drafts",
+            headers={
+                "Authorization": f"Bearer {access_token}",
+                "Content-Type": "application/json",
+            },
+            json={"message": {"raw": raw}},
+        )
+    if r.status_code >= 300:
+        raise RuntimeError(f"Gmail drafts.create failed: {r.status_code} {r.text}")
+    return r.json()
