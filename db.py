@@ -30,10 +30,26 @@ CREATE TABLE IF NOT EXISTS users (
     linkedin      TEXT NOT NULL DEFAULT '',
     access_token  TEXT NOT NULL,           -- Gmail access token (short-lived, rotated on sign-in)
     access_expires_at TEXT NOT NULL DEFAULT '',  -- ISO 8601 UTC, empty if unknown
+    refresh_token TEXT NOT NULL DEFAULT '',  -- Gmail refresh token (long-lived)
     created_at    TEXT NOT NULL            -- ISO 8601 UTC
 );
 
 CREATE INDEX IF NOT EXISTS idx_users_email ON users(email);
+
+CREATE TABLE IF NOT EXISTS scheduled_emails (
+    id            INTEGER PRIMARY KEY AUTOINCREMENT,
+    user_id       TEXT NOT NULL,
+    sheet_row     INTEGER NOT NULL,
+    to_email      TEXT NOT NULL,
+    subject       TEXT NOT NULL,
+    body          TEXT NOT NULL,
+    draft_id      TEXT NOT NULL DEFAULT '', -- Gmail draft ID
+    scheduled_at  TEXT NOT NULL,         -- ISO 8601 UTC timestamp
+    status        TEXT NOT NULL DEFAULT 'pending', -- pending, sent, failed
+    error         TEXT,
+    created_at    TEXT NOT NULL,         -- ISO 8601 UTC timestamp
+    FOREIGN KEY (user_id) REFERENCES users(id) ON DELETE CASCADE
+);
 """
 
 
@@ -42,6 +58,20 @@ async def _ensure_schema() -> None:
     async with connect(DB_PATH) as db:
         await db.executescript(SCHEMA)
         await db.commit()
+        # Migration: Add refresh_token column to users table if not exists
+        try:
+            await db.execute("ALTER TABLE users ADD COLUMN refresh_token TEXT NOT NULL DEFAULT ''")
+            await db.commit()
+        except Exception:
+            # Column already exists
+            pass
+        # Migration: Add draft_id column to scheduled_emails table if not exists
+        try:
+            await db.execute("ALTER TABLE scheduled_emails ADD COLUMN draft_id TEXT NOT NULL DEFAULT ''")
+            await db.commit()
+        except Exception:
+            # Column already exists
+            pass
 
 
 @asynccontextmanager
@@ -71,6 +101,7 @@ async def upsert_user(
     linkedin: str,
     access_token: str,
     access_expires_at: str = "",
+    refresh_token: str = "",
 ) -> dict[str, Any]:
     """Insert or update a user. Returns the user row as a dict.
 
@@ -86,8 +117,8 @@ async def upsert_user(
         await db.execute(
             """
             INSERT INTO users (
-                id, email, name, username, phone, linkedin, access_token, access_expires_at, created_at
-            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+                id, email, name, username, phone, linkedin, access_token, access_expires_at, refresh_token, created_at
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
             ON CONFLICT(id) DO UPDATE SET
                 email = excluded.email,
                 name = excluded.name,
@@ -95,9 +126,10 @@ async def upsert_user(
                 phone = excluded.phone,
                 linkedin = excluded.linkedin,
                 access_token = excluded.access_token,
-                access_expires_at = excluded.access_expires_at
+                access_expires_at = excluded.access_expires_at,
+                refresh_token = CASE WHEN excluded.refresh_token != '' THEN excluded.refresh_token ELSE users.refresh_token END
             """,
-            (google_sub, email, name, username, phone, linkedin, access_token, access_expires_at, created_at),
+            (google_sub, email, name, username, phone, linkedin, access_token, access_expires_at, refresh_token, created_at),
         )
         await db.commit()
         async with db.execute(

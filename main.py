@@ -18,6 +18,7 @@ place for the personalisation pass (later PR).
 """
 from __future__ import annotations
 
+import asyncio
 from datetime import datetime, timedelta, timezone
 from typing import Any, Optional
 
@@ -29,8 +30,14 @@ import auth
 import db
 import services.claims as claims
 import services.templates as templates
+from services.scheduler import start_email_scheduler
 
 app = FastAPI(title="Hello Kitty", version="0.3.0")
+
+@app.on_event("startup")
+async def startup_event():
+    asyncio.create_task(start_email_scheduler())
+
 
 # Permissive CORS for dev with credential support.
 app.add_middleware(
@@ -47,12 +54,14 @@ app.add_middleware(
 class SignInBody(BaseModel):
     """Body for /auth/google.
 
-    access_token: required (used for both identity and Gmail).
+    code:         optional OAuth authorization code (new flow).
+    access_token: optional (legacy/dev flow).
     id_token:     optional. If present, used instead of access_token.
-    expires_in:   seconds until access_token expires (from GIS). Default 3600.
-    username:     optional handle for "CONTACTED BY" column (defaults to Google name/email).
+    expires_in:   seconds until access_token expires. Default 3600.
+    username:     optional handle for "CONTACTED BY" column.
     """
-    access_token: str
+    code: Optional[str] = None
+    access_token: Optional[str] = None
     id_token: Optional[str] = None
     expires_in: int = 3600
     username: str = Field(default="", max_length=64)
@@ -78,11 +87,27 @@ async def healthz() -> dict[str, Any]:
 
 @app.post("/auth/google", response_model=SignInResponse)
 async def sign_in(body: SignInBody, response: Response) -> SignInResponse:
-    # Identity: id_token if provided (faster), else access_token via userinfo.
-    if body.id_token:
-        claims_data = await auth.verify_google_id_token(body.id_token)
+    # Exchange code for tokens if code is provided
+    if body.code:
+        tokens = await auth.exchange_code_for_tokens(body.code)
+        access_token = tokens["access_token"]
+        refresh_token = tokens.get("refresh_token", "")
+        expires_in = tokens.get("expires_in", 3600)
+        id_token = tokens.get("id_token")
     else:
-        claims_data = await auth.fetch_google_user_via_access_token(body.access_token)
+        # Fallback to access_token from body (dev / legacy flow)
+        if not body.access_token:
+            raise HTTPException(status_code=400, detail="Either code or access_token must be provided")
+        access_token = body.access_token
+        refresh_token = ""
+        expires_in = body.expires_in
+        id_token = body.id_token
+
+    # Identity verification
+    if id_token:
+        claims_data = await auth.verify_google_id_token(id_token)
+    else:
+        claims_data = await auth.fetch_google_user_via_access_token(access_token)
 
     google_sub = claims_data["sub"]
     email = claims_data["email"]
@@ -90,7 +115,7 @@ async def sign_in(body: SignInBody, response: Response) -> SignInResponse:
     user_handle = body.username.strip() or name.split()[0].lower() or email.split("@")[0]
 
     expires_at = (
-        datetime.now(timezone.utc) + timedelta(seconds=body.expires_in)
+        datetime.now(timezone.utc) + timedelta(seconds=expires_in)
     ).isoformat()
 
     user = await db.upsert_user(
@@ -100,8 +125,9 @@ async def sign_in(body: SignInBody, response: Response) -> SignInResponse:
         username=user_handle,
         phone=body.phone,
         linkedin=body.linkedin,
-        access_token=body.access_token,
+        access_token=access_token,
         access_expires_at=expires_at,
+        refresh_token=refresh_token,
     )
     auth.set_session(response, user["id"])
     return SignInResponse(

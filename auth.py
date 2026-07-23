@@ -169,5 +169,81 @@ async def get_current_user(request: Request) -> dict[str, Any]:
     return user
 
 
+async def exchange_code_for_tokens(code: str) -> dict[str, Any]:
+    """Exchange OAuth authorization code for access and refresh tokens.
+
+    In dev mode (no CLIENT_ID/CLIENT_SECRET), returns fake credentials.
+    """
+    if not CLIENT_ID or not CLIENT_SECRET:
+        return {
+            "access_token": "dev-fake-token",
+            "refresh_token": "dev-fake-refresh-token",
+            "expires_in": 3600,
+            "id_token": None,
+        }
+
+    async with httpx.AsyncClient(timeout=10) as client:
+        r = await client.post(
+            GOOGLE_TOKEN_URL,
+            data={
+                "code": code,
+                "client_id": CLIENT_ID,
+                "client_secret": CLIENT_SECRET,
+                "redirect_uri": "postmessage",
+                "grant_type": "authorization_code",
+            },
+        )
+    if r.status_code != 200:
+        raise HTTPException(
+            status_code=401,
+            detail=f"Google token exchange failed: {r.status_code} {r.text}",
+        )
+    return r.json()
+
+
+async def refresh_access_token(user: dict[str, Any]) -> str:
+    """Refresh the user's access token using their refresh_token.
+
+    If in dev mode or no refresh token, return current access token.
+    Stores the new access token and its expiry in the database.
+    """
+    refresh_token = user.get("refresh_token")
+    if not refresh_token or not CLIENT_ID or not CLIENT_SECRET:
+        # Dev mode or missing token
+        return user.get("access_token", "")
+
+    async with httpx.AsyncClient(timeout=10) as client:
+        r = await client.post(
+            GOOGLE_TOKEN_URL,
+            data={
+                "client_id": CLIENT_ID,
+                "client_secret": CLIENT_SECRET,
+                "refresh_token": refresh_token,
+                "grant_type": "refresh_token",
+            },
+        )
+    if r.status_code != 200:
+        raise RuntimeError(f"Google token refresh failed: {r.status_code} {r.text}")
+
+    resp = r.json()
+    new_access_token = resp["access_token"]
+    expires_in = resp.get("expires_in", 3600)
+
+    from datetime import timedelta
+    expires_at = (
+        datetime.now(timezone.utc) + timedelta(seconds=expires_in)
+    ).isoformat()
+
+    # Save the updated token back to the database
+    async with db.get_db() as database:
+        await database.execute(
+            "UPDATE users SET access_token = ?, access_expires_at = ? WHERE id = ?",
+            (new_access_token, expires_at, user["id"]),
+        )
+        await database.commit()
+
+    return new_access_token
+
+
 def is_dev_mode() -> bool:
     return DEV_MODE

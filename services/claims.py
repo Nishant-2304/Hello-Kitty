@@ -197,9 +197,20 @@ async def _attempt(user: dict[str, Any], result: RunResult) -> str:
         # Fall through and push the surviving drafts anyway.
         # (We don't release the still-ours drafts; they're still ours.)
 
-    # Push to Gmail.
+    # Schedule emails by creating a Gmail draft, inserting into SQLite scheduled_emails, and updating Sheet status.
+    from services.scheduler import get_next_working_day_9am_ist
+    from datetime import datetime, timezone
+    import db
+
+    scheduled_dt = get_next_working_day_9am_ist(datetime.now(timezone.utc))
+    # Convert scheduled datetime to UTC string for DB comparison
+    scheduled_utc_str = scheduled_dt.astimezone(timezone.utc).isoformat()
+    # Format scheduled datetime as IST string for Sheet update
+    scheduled_ist_str = scheduled_dt.strftime("%Y-%m-%d %H:%M:%S IST")
+
     for d in drafts:
         try:
+            # 1. Create Gmail Draft first so it's visible in user's Drafts folder
             resp = await gmail.create_draft(
                 user,
                 to=d.to_email,
@@ -208,19 +219,42 @@ async def _attempt(user: dict[str, Any], result: RunResult) -> str:
                 client_id=CLIENT_ID,
                 client_secret=CLIENT_SECRET,
             )
+            draft_id = resp.get("id")
+            if not draft_id:
+                raise RuntimeError("Gmail drafts.create returned no draft ID")
+
+            # 2. Insert draft and schedule metadata into SQLite database
+            async with db.get_db() as database:
+                await database.execute(
+                    """
+                    INSERT INTO scheduled_emails (user_id, sheet_row, to_email, subject, body, draft_id, scheduled_at, created_at)
+                    VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+                    """,
+                    (
+                        user["id"],
+                        d.sheet_row,
+                        d.to_email,
+                        d.subject,
+                        d.body,
+                        draft_id,
+                        scheduled_utc_str,
+                        datetime.now(timezone.utc).isoformat(),
+                    ),
+                )
+                await database.commit()
             d.pushed = True
-            d.draft_id = resp.get("id")
+            d.draft_id = draft_id
             result.drafted.append(d)
         except Exception as e:
             d.error = str(e)
             result.failed.append(d)
 
-    # Mark the successfully pushed rows as drafted.
+    # Mark the successfully scheduled rows in the sheet.
     pushed_rows = [d.sheet_row for d in result.drafted if d.pushed]
     if pushed_rows:
-        sheets.mark_drafted(pushed_rows, username)
+        sheets.mark_scheduled(pushed_rows, username, scheduled_ist_str)
 
-    # Release the rows where Gmail failed — they shouldn't stay
+    # Release the rows where scheduling failed — they shouldn't stay
     # 'claimed' forever.
     failed_rows = [d.sheet_row for d in result.failed]
     if failed_rows:

@@ -34,6 +34,9 @@ if not SHEET_ID:
 STATUS_PENDING = ""           # empty cell = available
 STATUS_CLAIMED = "claimed"
 STATUS_DRAFTED = "drafted"
+STATUS_SCHEDULED = "scheduled"
+STATUS_SENT = "sent"
+STATUS_FAILED = "failed"
 
 # Per-process lock for the /run claim step. Good enough for 10 users;
 # if you scale beyond that, swap for a Redis lock keyed on SHEET_ID.
@@ -284,6 +287,64 @@ def mark_drafted(rows: Iterable[int], username: str) -> None:
         for r in rows
     ]
     sheet.batch_update(updates)
+
+
+def mark_scheduled(rows: Iterable[int], username: str, scheduled_ist_str: str) -> None:
+    """Mark rows as 'scheduled' by `username`."""
+    rows = list(rows)
+    if not rows:
+        return
+
+    sheet = _get_sheet()
+    headers = _get_headers(sheet)
+    status_col = _find_col(headers, "status")
+    contacted_col = _find_col(headers, "contacted by")
+    if status_col is None or contacted_col is None:
+        raise ValueError(
+            f"Sheet must have STATUS and CONTACTED BY columns. "
+            f"Found headers: {headers}"
+        )
+
+    status_value = STATUS_SCHEDULED
+    contact_value = f"{username} (scheduled for {scheduled_ist_str})"
+
+    updates = [
+        {"range": f"{_col_letter(status_col)}{r}", "values": [[status_value]]}
+        for r in rows
+    ] + [
+        {"range": f"{_col_letter(contacted_col)}{r}", "values": [[contact_value]]}
+        for r in rows
+    ]
+    sheet.batch_update(updates)
+
+
+def mark_sent(sheet_row: int, username: str) -> None:
+    """Mark a single row as 'sent' in Google Sheets."""
+    sheet = _get_sheet()
+    headers = _get_headers(sheet)
+    status_col = _find_col(headers, "status")
+    contacted_col = _find_col(headers, "contacted by")
+    if status_col is None or contacted_col is None:
+        raise ValueError("Sheet must have STATUS and CONTACTED BY columns.")
+
+    timestamp = _now_iso()
+    sheet.update_cell(sheet_row, status_col, STATUS_SENT)
+    sheet.update_cell(sheet_row, contacted_col, f"{username} (sent at {timestamp})")
+
+
+def mark_failed(sheet_row: int, username: str, error: str) -> None:
+    """Mark a single row as 'failed' in Google Sheets with error details."""
+    sheet = _get_sheet()
+    headers = _get_headers(sheet)
+    status_col = _find_col(headers, "status")
+    contacted_col = _find_col(headers, "contacted by")
+    if status_col is None or contacted_col is None:
+        raise ValueError("Sheet must have STATUS and CONTACTED BY columns.")
+
+    sheet.update_cell(sheet_row, status_col, STATUS_FAILED)
+    # Truncate error to fit cleanly
+    error_snippet = error[:80]
+    sheet.update_cell(sheet_row, contacted_col, f"{username} (failed: {error_snippet})")
 
 
 def get_lock() -> asyncio.Lock:
